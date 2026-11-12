@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Юрский берег — 3D анимация</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #2a1a2e; font-family: Georgia, serif; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 28px; text-align: center; color: #ffe2c4;
+         text-shadow: 0 2px 8px #000; font-size: 22px; pointer-events: none; letter-spacing: .5px; }
+  #ui { position: fixed; top: 14px; right: 14px; display: flex; gap: 8px; }
+  button { background: rgba(0,0,0,.45); color: #ffe2c4; border: 1px solid #ffb27a66; border-radius: 6px;
+           padding: 6px 12px; cursor: pointer; font: 14px Georgia, serif; }
+  button:hover { background: rgba(0,0,0,.7); }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="hud"></div>
+<div id="ui"><button id="restart">⟲ Сначала</button></div>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xd98a5a, 60, 190);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 400);
+
+// Sky dome: warm sunset gradient, no visible sun disc.
+scene.add(new THREE.Mesh(
+  new THREE.SphereGeometry(300, 32, 16),
+  new THREE.ShaderMaterial({
+    side: THREE.BackSide, fog: false, depthWrite: false,
+    uniforms: {},
+    vertexShader: `varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+    fragmentShader: `varying vec3 vP; void main(){
+      float h = normalize(vP).y;
+      vec3 c = mix(vec3(0.98,0.55,0.30), vec3(0.95,0.78,0.55), smoothstep(-0.05,0.08,h));
+      c = mix(c, vec3(0.45,0.30,0.50), smoothstep(0.08,0.55,h));
+      c = mix(c, vec3(0.16,0.12,0.30), smoothstep(0.55,1.0,h));
+      gl_FragColor = vec4(c,1.); }`
+  })));
+
+// ---------- lights (low warm sun, long shadows) ----------
+const sun = new THREE.DirectionalLight(0xffa15a, 2.6);
+sun.position.set(45, 13, 70); // low over the river, lighting what the camera sees
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 220 });
+sun.shadow.bias = -0.0008;
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0x9d7ab5, 0x5a3a24, 1.2));
+scene.add(new THREE.AmbientLight(0xff9a60, 0.25));
+
+// ---------- terrain ----------
+const SIZE = 220, SEG = 160;
+function noise(x, z) {
+  return Math.sin(x * 0.11) * Math.cos(z * 0.13) * 1.1
+       + Math.sin(x * 0.31 + 1.3) * Math.cos(z * 0.27) * 0.45
+       + Math.sin(x * 0.9 + z * 0.7) * 0.12;
+}
+// River runs along X at z ≈ 22 (far side); camp side is z < 10.
+function riverDepth(x, z) {
+  const c = 24 + Math.sin(x * 0.04) * 4;
+  const d = Math.abs(z - c);
+  return Math.max(0, 1 - d / 9);
+}
+function groundH(x, z) {
+  let h = noise(x, z);
+  const rd = riverDepth(x, z);
+  h -= rd * rd * 4.2;
+  h += Math.max(0, (z - 40)) * 0.08 + Math.max(0, -z - 45) * 0.12; // valley walls
+  return h;
+}
+const gGeo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
+gGeo.rotateX(-Math.PI / 2);
+{
+  const p = gGeo.attributes.position, col = [];
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), z = p.getZ(i), h = groundH(x, z);
+    p.setY(i, h);
+    const rd = riverDepth(x, z);
+    const stone = new THREE.Color(0x7d6a5a), dirt = new THREE.Color(0x6a5238), grass = new THREE.Color(0x5b6a33);
+    const c = dirt.clone().lerp(grass, THREE.MathUtils.clamp(h * 0.4 + 0.3, 0, 1)).lerp(stone, rd * 0.9);
+    col.push(c.r, c.g, c.b);
+  }
+  gGeo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  gGeo.computeVertexNormals();
+}
+const ground = new THREE.Mesh(gGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }));
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ---------- river ----------
+const waterGeo = new THREE.PlaneGeometry(SIZE, 22, 120, 12);
+waterGeo.rotateX(-Math.PI / 2);
+const water = new THREE.Mesh(waterGeo, new THREE.MeshStandardMaterial({
+  color: 0x6a4d3c, metalness: 0.6, roughness: 0.25, transparent: true, opacity: 0.85 }));
+water.position.set(0, -1.1, 24);
+scene.add(water);
+const waterBase = waterGeo.attributes.position.array.slice();
+
+// ---------- rocks ----------
+const rockMat = new THREE.MeshStandardMaterial({ color: 0x8a7c6e, roughness: 0.95, flatShading: true });
+const rockGeo = new THREE.DodecahedronGeometry(1, 0);
+const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 420);
+rocks.castShadow = rocks.receiveShadow = true;
+{
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), s = new THREE.Vector3();
+  let r = 7;
+  const rnd = () => (r = (r * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < rocks.count; i++) {
+    const x = (rnd() - 0.5) * 200;
+    const z = 10 + rnd() * 10 + Math.sin(x * 0.04) * 4 + (rnd() < 0.3 ? 16 : 0);
+    const sc = 0.25 + rnd() * rnd() * 1.6;
+    e.set(rnd() * 3, rnd() * 3, rnd() * 3); q.setFromEuler(e);
+    s.set(sc * (0.8 + rnd()), sc * 0.6, sc * (0.8 + rnd()));
+    m.compose(new THREE.Vector3(x, groundH(x, z) + sc * 0.2, z), q, s);
+    rocks.setMatrixAt(i, m);
+  }
+}
+scene.add(rocks);
+
+// ---------- plants ----------
+const leafMat = new THREE.MeshStandardMaterial({ color: 0x4f7a2e, roughness: 0.9, side: THREE.DoubleSide });
+const darkLeaf = new THREE.MeshStandardMaterial({ color: 0x2f5a2a, roughness: 0.9, side: THREE.DoubleSide });
+const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5a3b22, roughness: 1 });
+const pineMat = new THREE.MeshStandardMaterial({ color: 0x24472a, roughness: 0.95, flatShading: true });
+const plants = new THREE.Group(); scene.add(plants);
+// camera corridor on the river side, the clearing around the carcass and the forest gap stay free of plants
+const blocked = (x, z) => (z > 4 && z < 21 && x > -36 && x < 32) || (x > -32 && x < -4 && z > -16 && z < 6) || Math.hypot(x, z - 2) < 12;
+let seed = 42;
+const rnd = () => (seed = (seed * 48271) % 2147483647) / 2147483647;
+
+function fern(x, z, sc = 1) {
+  const g = new THREE.Group();
+  const n = 7 + Math.floor(rnd() * 4);
+  for (let i = 0; i < n; i++) {
+    const leaf = new THREE.Mesh(new THREE.PlaneGeometry(0.35, 1.8, 1, 4), leafMat);
+    leaf.geometry.translate(0, 0.9, 0);
+    const p = leaf.geometry.attributes.position;
+    for (let k = 0; k < p.count; k++) p.setZ(k, -Math.pow(p.getY(k) / 1.8, 2) * 0.9);
+    leaf.rotation.y = (i / n) * Math.PI * 2;
+    leaf.rotation.x = -0.25;
+    leaf.castShadow = true;
+    g.add(leaf);
+  }
+  if (blocked(x, z)) return;
+  g.position.set(x, groundH(x, z), z); g.scale.setScalar(sc);
+  plants.add(g);
+}
+function cycad(x, z, sc = 1) {
+  const g = new THREE.Group();
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.6, 1.6, 8), trunkMat);
+  trunk.position.y = 0.8; trunk.castShadow = true; g.add(trunk);
+  const n = 14;
+  for (let i = 0; i < n; i++) {
+    const fr = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 3.2, 1, 5), darkLeaf);
+    fr.geometry.translate(0, 1.6, 0);
+    const p = fr.geometry.attributes.position;
+    for (let k = 0; k < p.count; k++) p.setZ(k, -Math.pow(p.getY(k) / 3.2, 2) * 1.6);
+    fr.position.y = 1.6; fr.rotation.y = (i / n) * Math.PI * 2; fr.rotation.x = -0.9 + (i % 3) * 0.25;
+    fr.castShadow = true; g.add(fr);
+  }
+  if (blocked(x, z)) return;
+  g.position.set(x, groundH(x, z), z); g.scale.setScalar(sc); plants.add(g);
+}
+function horsetail(x, z, sc = 1) {
+  const g = new THREE.Group();
+  const h = 2.5 + rnd() * 2;
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.09, h, 6), leafMat);
+  stem.position.y = h / 2; g.add(stem);
+  for (let y = 0.6; y < h; y += 0.55) {
+    const ring = new THREE.Mesh(new THREE.ConeGeometry(0.35, 0.5, 8, 1, true), leafMat);
+    ring.position.y = y; ring.rotation.x = Math.PI; g.add(ring);
+  }
+  g.position.set(x, groundH(x, z), z); g.scale.setScalar(sc); plants.add(g);
+}
+function pine(x, z, sc = 1) {
+  const g = new THREE.Group();
+  const h = 10 + rnd() * 6;
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.5, h, 7), trunkMat);
+  trunk.position.y = h / 2; trunk.castShadow = true; g.add(trunk);
+  for (let i = 0; i < 5; i++) {
+    const r = 3.2 - i * 0.5;
+    const c = new THREE.Mesh(new THREE.ConeGeometry(r, 3.2, 9), pineMat);
+    c.position.y = h * 0.35 + i * 1.8; c.castShadow = true; g.add(c);
+  }
+  g.position.set(x, groundH(x, z), z); g.scale.setScalar(sc); g.rotation.y = rnd() * 6; plants.add(g);
+}
+function araucaria(x, z, sc = 1) {
+  const g = new THREE.Group();
+  const h = 12 + rnd() * 5;
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.6, h, 7), trunkMat);
+  trunk.position.y = h / 2; trunk.castShadow = true; g.add(trunk);
+  for (let i = 0; i < 7; i++) {
+    const y = h * 0.45 + i * (h * 0.08);
+    const n = 6;
+    for (let k = 0; k < n; k++) {
+      const br = new THREE.Mesh(new THREE.ConeGeometry(0.35, 3.5 - i * 0.35, 5), pineMat);
+      br.geometry.translate(0, 1.7 - i * 0.17, 0);
+      br.rotation.z = Math.PI / 2 - 0.35; br.rotation.y = (k / n) * Math.PI * 2 + i * 0.5;
+      br.position.y = y; br.castShadow = true; g.add(br);
+    }
+  }
+  g.position.set(x, groundH(x, z), z); g.scale.setScalar(sc); plants.add(g);
+}
+// Undergrowth near the bank.
+for (let i = 0; i < 70; i++) { const x = (rnd() - 0.5) * 160, z = -2 + rnd() * 10; if (Math.abs(x) > 6 || z < 1) fern(x, z, 0.7 + rnd() * 0.8); }
+for (let i = 0; i < 40; i++) { const x = (rnd() - 0.5) * 160, z = 12 + rnd() * 6; horsetail(x, z, 0.8 + rnd() * 0.6); }
+for (let i = 0; i < 24; i++) { const x = (rnd() - 0.5) * 160, z = -12 + rnd() * 10; if (Math.abs(x) > 10) cycad(x, z, 0.8 + rnd() * 0.7); }
+for (let i = 0; i < 20; i++) { const x = (rnd() - 0.5) * 180, z = 34 + rnd() * 20; cycad(x, z, 1 + rnd()); }
+// Pine forest: behind the bank (z < -16), with a gap the therizinosaur walks out of at x ≈ -22.
+for (let i = 0; i < 90; i++) {
+  const x = (rnd() - 0.5) * 200, z = -18 - rnd() * 40;
+  if (Math.abs(x + 22) < 5 && z > -30) continue;
+  (rnd() < 0.7 ? pine : araucaria)(x, z, 0.8 + rnd() * 0.6);
+}
+for (let i = 0; i < 40; i++) { const x = (rnd() - 0.5) * 200, z = 44 + rnd() * 30; araucaria(x, z, 0.9 + rnd() * 0.6); }
+
+// ---------- dinosaur builders ----------
+const matRaptor = new THREE.MeshStandardMaterial({ color: 0x8c6a3f, roughness: 0.8 });
+const matRaptorStripe = new THREE.MeshStandardMaterial({ color: 0x4a3420, roughness: 0.8 });
+const matRex = new THREE.MeshStandardMaterial({ color: 0x5c5247, roughness: 0.9 });
+const matRexBelly = new THREE.MeshStandardMaterial({ color: 0x8a7a66, roughness: 0.9 });
+const matBlood = new THREE.MeshStandardMaterial({ color: 0x5a0f12, roughness: 0.6 });
+const matTheri = new THREE.MeshStandardMaterial({ color: 0x6b4a2a, roughness: 0.85 });
+const matTheriFeather = new THREE.MeshStandardMaterial({ color: 0xa8784a, roughness: 0.95, side: THREE.DoubleSide });
+const matClaw = new THREE.MeshStandardMaterial({ color: 0xe8dcc0, roughness: 0.4 });
+const matEye = new THREE.MeshStandardMaterial({ color: 0xffd34a, emissive: 0x553300 });
+const matTeeth = new THREE.MeshStandardMaterial({ color: 0xf2eadb, roughness: 0.5 });
+
+function mesh(geo, mat, p = [0, 0, 0], r = [0, 0, 0], s = [1, 1, 1]) {
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(...p); m.rotation.set(...r); m.scale.set(...s);
+  m.castShadow = true; m.receiveShadow = true;
+  return m;
+}
+const sph = (r) => new THREE.SphereGeometry(r, 14, 10);
+const cone = (r, h) => new THREE.ConeGeometry(r, h, 10);
+const cyl = (r1, r2, h) => new THREE.CylinderGeometry(r1, r2, h, 10);
+
+function leg(mat, scale, bird = true) {
+  // hip -> thigh -> knee -> shin -> ankle -> foot. Returns pivots for animation.
+  const hip = new THREE.Group();
+  const thigh = mesh(cyl(0.18, 0.13, 1), mat, [0, -0.5, 0]); thigh.scale.set(scale, scale, scale);
+  hip.add(thigh);
+  const knee = new THREE.Group(); knee.position.y = -1 * scale; hip.add(knee);
+  const shin = mesh(cyl(0.12, 0.09, 1), mat, [0, -0.5 * scale, 0], [0, 0, 0], [scale, scale, scale]); knee.add(shin);
+  const ankle = new THREE.Group(); ankle.position.y = -1 * scale; knee.add(ankle);
+  const foot = mesh(new THREE.BoxGeometry(0.22, 0.1, 0.5), mat, [0, -0.05 * scale, 0.15 * scale], [0, 0, 0], [scale, scale, scale]); ankle.add(foot);
+  for (let i = -1; i <= 1; i++) ankle.add(mesh(cone(0.04, 0.22), matClaw, [i * 0.08 * scale, -0.06 * scale, 0.42 * scale], [Math.PI / 2, 0, 0], [scale, scale, scale]));
+  if (bird) ankle.add(mesh(cone(0.05, 0.3), matClaw, [-0.1 * scale, -0.02 * scale, 0.25 * scale], [Math.PI / 2 - 0.9, 0, 0], [scale, scale, scale]));
+  return { hip, knee, ankle };
+}
+
+function buildRaptor() {
+  const root = new THREE.Group();
+  const body = new THREE.Group(); body.position.y = 1.35; root.add(body);
+  const torso = mesh(sph(0.42), matRaptor, [0, 0, 0], [0, 0, 0], [1, 1, 1.7]); body.add(torso);
+  body.add(mesh(sph(0.3), matRaptorStripe, [0, 0.2, 0], [0, 0, 0], [1.1, 0.8, 2.2]));
+  // tail
+  const tail = new THREE.Group(); tail.position.set(0, 0.05, -0.6); body.add(tail);
+  let seg = tail;
+  const tailSegs = [];
+  for (let i = 0; i < 4; i++) {
+    const s = new THREE.Group(); s.position.z = -0.45;
+    s.add(mesh(cyl(0.2 - i * 0.045, 0.16 - i * 0.045, 0.5), matRaptor, [0, 0, -0.25], [Math.PI / 2, 0, 0]));
+    seg.add(s); seg = s; tailSegs.push(s);
+  }
+  // neck + head
+  const neck = new THREE.Group(); neck.position.set(0, 0.25, 0.65); body.add(neck);
+  neck.add(mesh(cyl(0.16, 0.22, 0.7), matRaptor, [0, 0.25, 0.15], [-0.5, 0, 0]));
+  const head = new THREE.Group(); head.position.set(0, 0.55, 0.35); neck.add(head);
+  head.add(mesh(sph(0.22), matRaptor, [0, 0, 0], [0, 0, 0], [0.9, 0.8, 1.6]));
+  head.add(mesh(new THREE.BoxGeometry(0.22, 0.12, 0.5), matRaptor, [0, -0.02, 0.45]));
+  head.add(mesh(sph(0.05), matEye, [0.14, 0.08, 0.1])); head.add(mesh(sph(0.05), matEye, [-0.14, 0.08, 0.1]));
+  const jaw = new THREE.Group(); jaw.position.set(0, -0.1, 0.1); head.add(jaw);
+  jaw.add(mesh(new THREE.BoxGeometry(0.2, 0.08, 0.55), matRaptor, [0, -0.02, 0.3]));
+  for (let i = 0; i < 5; i++) { jaw.add(mesh(cone(0.02, 0.07), matTeeth, [0.08, 0.04, 0.15 + i * 0.09])); jaw.add(mesh(cone(0.02, 0.07), matTeeth, [-0.08, 0.04, 0.15 + i * 0.09])); }
+  // arms (feathered)
+  const arms = [];
+  for (const sx of [-1, 1]) {
+    const a = new THREE.Group(); a.position.set(sx * 0.3, -0.05, 0.4); body.add(a);
+    a.add(mesh(cyl(0.06, 0.05, 0.45), matRaptor, [0, -0.2, 0.1], [-0.5, 0, 0]));
+    a.add(mesh(new THREE.PlaneGeometry(0.5, 0.25), matRaptorStripe, [sx * 0.05, -0.2, 0], [0, Math.PI / 2, 0]));
+    a.add(mesh(cone(0.03, 0.18), matClaw, [0, -0.4, 0.25], [Math.PI / 2, 0, 0]));
+    arms.push(a);
+  }
+  // legs
+  const legs = [];
+  for (const sx of [-1, 1]) {
+    const l = leg(matRaptor, 0.62); l.hip.position.set(sx * 0.28, -0.1, -0.2); body.add(l.hip); legs.push(l);
+  }
+  root.userData = { body, neck, head, jaw, tail: tailSegs, legs, arms };
+  return root;
+}
+
+function buildTheri() {
+  const root = new THREE.Group();
+  const body = new THREE.Group(); body.position.y = 3.6; root.add(body);
+  body.add(mesh(sph(1.35), matTheri, [0, 0, 0], [0, 0, 0], [1, 1.1, 1.5]));
+  body.add(mesh(sph(1.1), matTheriFeather, [0, 0.55, -0.1], [0, 0, 0], [1.25, 0.8, 1.9])); // feathered back
+  // feather tufts along the back
+  for (let i = 0; i < 8; i++) body.add(mesh(new THREE.PlaneGeometry(0.5, 0.9), matTheriFeather, [(i % 2 ? 0.5 : -0.5), 1.3, 1.2 - i * 0.35], [0.4, (i % 2 ? 1 : -1) * 0.6, 0]));
+  // tail
+  const tail = new THREE.Group(); tail.position.set(0, -0.1, -1.7); body.add(tail);
+  let seg = tail; const tailSegs = [];
+  for (let i = 0; i < 4; i++) {
+    const s = new THREE.Group(); s.position.z = -0.8;
+    s.add(mesh(cyl(0.65 - i * 0.14, 0.5 - i * 0.14, 0.9), matTheri, [0, 0, -0.45], [Math.PI / 2, 0, 0]));
+    s.add(mesh(new THREE.PlaneGeometry(0.9, 0.6), matTheriFeather, [0, 0.4, -0.45], [0, Math.PI / 2, 0]));
+    seg.add(s); seg = s; tailSegs.push(s);
+  }
+  // long neck (3 segments) + small head
+  const neck = new THREE.Group(); neck.position.set(0, 0.9, 1.5); body.add(neck);
+  let n = neck; const neckSegs = [];
+  for (let i = 0; i < 3; i++) {
+    const s = new THREE.Group(); s.position.set(0, 0.95, 0); s.rotation.x = -0.35;
+    s.add(mesh(cyl(0.42 - i * 0.08, 0.5 - i * 0.08, 1.1), matTheri, [0, 0.5, 0]));
+    n.add(s); n = s; neckSegs.push(s);
+  }
+  const head = new THREE.Group(); head.position.set(0, 1.0, 0.1); n.add(head);
+  head.add(mesh(sph(0.35), matTheri, [0, 0, 0], [0, 0, 0], [0.9, 0.8, 1.5]));
+  head.add(mesh(new THREE.BoxGeometry(0.3, 0.18, 0.7), matTheri, [0, -0.05, 0.6]));
+  head.add(mesh(sph(0.07), matEye, [0.22, 0.12, 0.15])); head.add(mesh(sph(0.07), matEye, [-0.22, 0.12, 0.15]));
+  const jaw = new THREE.Group(); jaw.position.set(0, -0.18, 0.1); head.add(jaw);
+  jaw.add(mesh(new THREE.BoxGeometry(0.28, 0.14, 0.85), matTheri, [0, -0.05, 0.4]));
+  jaw.add(mesh(new THREE.BoxGeometry(0.2, 0.06, 0.6), matBlood, [0, 0.03, 0.35]));
+  // huge arms with three long claws
+  const arms = [];
+  for (const sx of [-1, 1]) {
+    const sh = new THREE.Group(); sh.position.set(sx * 1.3, 0.3, 0.9); body.add(sh);
+    sh.add(mesh(cyl(0.22, 0.18, 1.6), matTheri, [0, -0.8, 0]));
+    sh.add(mesh(new THREE.PlaneGeometry(1.6, 0.9), matTheriFeather, [sx * 0.15, -0.9, -0.2], [0, Math.PI / 2, 0]));
+    const el = new THREE.Group(); el.position.y = -1.6; sh.add(el);
+    el.add(mesh(cyl(0.17, 0.14, 1.4), matTheri, [0, -0.7, 0]));
+    const hand = new THREE.Group(); hand.position.y = -1.4; el.add(hand);
+    hand.add(mesh(sph(0.2), matTheri));
+    for (let i = -1; i <= 1; i++) {
+      const c = mesh(cone(0.07, 1.6), matClaw, [i * 0.15, -0.7, 0.3], [Math.PI + 0.5, 0, i * 0.12]);
+      hand.add(c);
+    }
+    arms.push({ sh, el, hand });
+  }
+  const legs = [];
+  for (const sx of [-1, 1]) {
+    const l = leg(matTheri, 1.55, false); l.hip.position.set(sx * 0.95, -0.4, -0.5); body.add(l.hip); legs.push(l);
+  }
+  root.userData = { body, neck: neckSegs, head, jaw, tail: tailSegs, legs, arms };
+  return root;
+}
+
+function buildDeadRex() {
+  const g = new THREE.Group();
+  const body = mesh(sph(1.9), matRex, [0, 0, 0], [0, 0, 0], [1, 1.1, 2]); g.add(body);
+  g.add(mesh(sph(1.6), matRexBelly, [0, -0.4, 0.2], [0, 0, 0], [1, 1, 1.8]));
+  // open wound
+  g.add(mesh(sph(1.1), matBlood, [0.9, -0.5, 0.8], [0, 0, 0], [1, 0.5, 1.2]));
+  // tail
+  let z = -3.4;
+  for (let i = 0; i < 5; i++) { g.add(mesh(cyl(1.3 - i * 0.22, 1.1 - i * 0.22, 2.3), matRex, [i * 0.3, -0.3 - i * 0.1, z], [Math.PI / 2, 0, -0.08 * i])); z -= 1.7; }
+  // neck + head
+  g.add(mesh(cyl(1.0, 1.4, 2.4), matRex, [0.2, 0.3, 4.2], [-Math.PI / 2 + 0.2, 0, 0]));
+  const head = new THREE.Group(); head.position.set(0.3, -0.2, 6.6); head.rotation.set(0.15, 0.4, 0.9); g.add(head);
+  head.add(mesh(sph(1.0), matRex, [0, 0, 0], [0, 0, 0], [0.9, 0.9, 1.5]));
+  head.add(mesh(new THREE.BoxGeometry(1.2, 0.8, 2.4), matRex, [0, -0.1, 1.6]));
+  head.add(mesh(new THREE.BoxGeometry(1.1, 0.4, 2.6), matRex, [0, -0.85, 1.5], [0.35, 0, 0]));
+  for (let i = 0; i < 7; i++) { head.add(mesh(cone(0.07, 0.3), matTeeth, [0.45, -0.55, 0.6 + i * 0.3], [Math.PI, 0, 0])); head.add(mesh(cone(0.07, 0.3), matTeeth, [-0.45, -0.55, 0.6 + i * 0.3], [Math.PI, 0, 0])); }
+  head.add(mesh(sph(0.16), new THREE.MeshStandardMaterial({ color: 0x222 }), [0.55, 0.3, 0.4]));
+  // legs (sprawled)
+  g.add(mesh(cyl(0.8, 0.55, 3.2), matRex, [1.4, -0.9, -0.8], [0.2, 0, -1.4]));
+  g.add(mesh(cyl(0.5, 0.35, 2.8), matRex, [3.6, -1.4, -0.3], [0.9, 0, -1.9]));
+  g.add(mesh(cyl(0.8, 0.55, 3.2), matRex, [-1.0, 0.4, -0.8], [0.3, 0, 1.6]));
+  g.add(mesh(cyl(0.5, 0.35, 2.8), matRex, [-2.8, 1.2, -0.6], [-0.4, 0, 1.3]));
+  // tiny arms
+  g.add(mesh(cyl(0.22, 0.15, 1.2), matRex, [1.4, 0.4, 2.8], [0.3, 0, -1.7]));
+  g.add(mesh(cyl(0.22, 0.15, 1.2), matRex, [-1.2, 1.4, 2.8], [0.3, 0, 1.5]));
+  // blood pool
+  g.add(mesh(new THREE.CircleGeometry(3.4, 24), matBlood, [1.2, -2.05, 1.5], [-Math.PI / 2, 0, 0], [1.3, 0.8, 1]));
+  g.rotation.z = 1.25; // lying on its side
+  return g;
+}
+
+// ---------- place actors ----------
+const REX = new THREE.Vector3(0, 0, 2);
+const rex = buildDeadRex();
+rex.scale.setScalar(0.62);
+rex.position.set(REX.x, groundH(REX.x, REX.z) + 1.25, REX.z);
+rex.rotation.y = -1.9; // head toward the forest, tail toward the raptors' approach
+scene.add(rex);
+
+const raptors = [];
+const raptorStart = [new THREE.Vector3(38, 0, 6), new THREE.Vector3(34, 0, -4), new THREE.Vector3(42, 0, 1)];
+const raptorFeed  = [new THREE.Vector3(3.6, 0, 5.2), new THREE.Vector3(2.4, 0, -1.6), new THREE.Vector3(5.2, 0, 1.4)];
+const raptorFlee  = [new THREE.Vector3(60, 0, 12), new THREE.Vector3(55, 0, -6), new THREE.Vector3(64, 0, 4)];
+for (let i = 0; i < 3; i++) {
+  const r = buildRaptor(); scene.add(r);
+  raptors.push({ obj: r, ...r.userData, start: raptorStart[i], feed: raptorFeed[i], flee: raptorFlee[i], delay: i * 0.5, phase: i * 1.7 });
+}
+const theri = buildTheri(); scene.add(theri);
+const THERI_START = new THREE.Vector3(-22, 0, -30);
+const THERI_END = new THREE.Vector3(-13, 0, -6);
+const tData = theri.userData;
+
+// ---------- helpers ----------
+const sm = (a, b, t) => { const x = THREE.MathUtils.clamp((t - a) / (b - a), 0, 1); return x * x * (3 - 2 * x); };
+const lerpV = (a, b, t, out) => out.copy(a).lerp(b, t);
+const tmp = new THREE.Vector3(), tmp2 = new THREE.Vector3();
+function placeOnGround(obj, p, lift = 0) { obj.position.set(p.x, groundH(p.x, p.z) + lift, p.z); }
+function faceDir(obj, from, to) { const a = Math.atan2(to.x - from.x, to.z - from.z); obj.rotation.y = a; }
+
+function animateRaptor(r, t, mode, speed) {
+  const { body, neck, head, jaw, tail, legs, arms } = r;
+  const w = t * 14 * speed + r.phase;
+  if (mode === 'run') {
+    body.position.y = 1.35 + Math.abs(Math.sin(w)) * 0.12;
+    body.rotation.x = 0.15;
+    legs[0].hip.rotation.x = Math.sin(w) * 0.9; legs[1].hip.rotation.x = Math.sin(w + Math.PI) * 0.9;
+    legs[0].knee.rotation.x = Math.max(0, -Math.sin(w)) * 1.2 + 0.3; legs[1].knee.rotation.x = Math.max(0, Math.sin(w)) * 1.2 + 0.3;
+    legs[0].ankle.rotation.x = -Math.max(0, -Math.sin(w)) * 0.8; legs[1].ankle.rotation.x = -Math.max(0, Math.sin(w)) * 0.8;
+    neck.rotation.x = 0.5 + Math.sin(w * 2) * 0.05; head.rotation.x = -0.2;
+    jaw.rotation.x = 0.25;
+    tail.forEach((s, i) => s.rotation.y = Math.sin(w * 0.5 + i * 0.6) * 0.12);
+    arms.forEach(a => a.rotation.x = -0.6);
+  } else if (mode === 'feed') {
+    const f = t * 3 + r.phase;
+    body.position.y = 1.15; body.rotation.x = 0.55;
+    legs.forEach(l => { l.hip.rotation.x = -0.55; l.knee.rotation.x = 1.3; l.ankle.rotation.x = -0.7; });
+    const tug = Math.max(0, Math.sin(f)) ** 3;
+    neck.rotation.x = 1.0 - tug * 0.9;
+    head.rotation.x = 0.3 - tug * 0.5;
+    jaw.rotation.x = 0.6 - tug * 0.5;
+    body.rotation.z = Math.sin(f * 0.5) * 0.05;
+    tail.forEach((s, i) => s.rotation.y = Math.sin(f * 0.7 + i) * 0.1);
+    arms.forEach(a => a.rotation.x = 0.4);
+  } else if (mode === 'alert') {
+    body.position.y = 1.45; body.rotation.x = -0.15;
+    legs.forEach(l => { l.hip.rotation.x = -0.2; l.knee.rotation.x = 0.5; l.ankle.rotation.x = -0.3; });
+    neck.rotation.x = -0.3; head.rotation.x = 0.1; jaw.rotation.x = 0.1;
+    tail.forEach((s, i) => s.rotation.y = Math.sin(t * 6 + i) * 0.05);
+  }
+}
+
+function animateTheri(t, mode, speed, roar) {
+  const { body, neck, head, jaw, tail, legs, arms } = tData;
+  const w = t * 4.5 * speed;
+  if (mode === 'walk') {
+    body.position.y = 3.6 + Math.abs(Math.sin(w)) * 0.12;
+    body.rotation.x = 0.12; body.rotation.z = Math.sin(w) * 0.03;
+    legs[0].hip.rotation.x = Math.sin(w) * 0.55; legs[1].hip.rotation.x = Math.sin(w + Math.PI) * 0.55;
+    legs[0].knee.rotation.x = Math.max(0, -Math.sin(w)) * 0.8 + 0.25; legs[1].knee.rotation.x = Math.max(0, Math.sin(w)) * 0.8 + 0.25;
+    legs[0].ankle.rotation.x = -Math.max(0, -Math.sin(w)) * 0.5; legs[1].ankle.rotation.x = -Math.max(0, Math.sin(w)) * 0.5;
+    neck.forEach((s, i) => s.rotation.x = -0.35 + Math.sin(w + i) * 0.04);
+    head.rotation.x = 0.55; jaw.rotation.x = 0.08;
+    arms.forEach((a, i) => { a.sh.rotation.x = -0.3 + Math.sin(w + i * Math.PI) * 0.1; a.el.rotation.x = -0.6; a.hand.rotation.x = -0.4; });
+  } else {
+    body.position.y = 3.6; body.rotation.x = 0.0;
+    legs.forEach(l => { l.hip.rotation.x = -0.1; l.knee.rotation.x = 0.35; l.ankle.rotation.x = -0.25; });
+    neck.forEach((s) => s.rotation.x = -0.35);
+    head.rotation.x = 0.55; jaw.rotation.x = 0.08;
+    arms.forEach((a) => { a.sh.rotation.x = -0.3; a.el.rotation.x = -0.6; a.hand.rotation.x = -0.4; });
+  }
+  arms.forEach((a) => a.sh.rotation.z = 0);
+  tail.forEach((s, i) => s.rotation.y = Math.sin(t * 1.5 + i * 0.7) * 0.08);
+  if (roar > 0) {
+    // raise neck, open jaw, spread the claws wide; a tremor sells the scream
+    const k = roar;
+    const trem = Math.sin(t * 40) * 0.025 * k;
+    body.rotation.x = -0.25 * k; body.position.y = 3.6 + 0.35 * k;
+    neck.forEach((s) => s.rotation.x = -0.35 - 0.12 * k + trem);
+    head.rotation.x = 0.55 - 0.7 * k + trem;
+    jaw.rotation.x = 0.08 + 0.9 * k;
+    arms.forEach((a, i) => {
+      const sx = i ? 1 : -1;
+      a.sh.rotation.x = -0.3 - 1.3 * k; a.sh.rotation.z = sx * 0.9 * k;
+      a.el.rotation.x = -0.6 - 0.5 * k; a.hand.rotation.x = -0.4 + 0.3 * k;
+    });
+  }
+}
+
+// ---------- timeline ----------
+// 0-4   establishing shot: bank, river, carcass
+// 3-8   raptors run in from the right
+// 8-13  raptors feed
+// 13-17 therizinosaur steps out of the pine forest, raptors look up
+// 17-21 roar; raptors flee
+// 21-30 therizinosaur stands over the scene, camera orbits it
+const T_END = 30;
+const hud = document.getElementById('hud');
+const captions = [
+  [0, 3, 'Каменистый берег реки. Закат.'],
+  [4, 8, 'Три велоцираптора почуяли падаль…'],
+  [9, 13, '…и принялись за тушу тираннозавра.'],
+  [13.5, 17, 'Из соснового леса выходит теризинозавр.'],
+  [17.5, 21, 'Его крик разгоняет всех.'],
+  [22, 30, 'Берег остаётся за ним.'],
+];
+
+const clock = new THREE.Clock();
+let t0 = 0;
+document.getElementById('restart').onclick = () => { t0 = clock.getElapsedTime(); };
+
+const camPos = new THREE.Vector3(), camLook = new THREE.Vector3();
+const raptorPos = raptors.map(() => new THREE.Vector3());
+
+function update(t) {
+  // ---- raptors ----
+  raptors.forEach((r, i) => {
+    const p = raptorPos[i];
+    const arrive = sm(3 + r.delay, 7.5 + r.delay, t);
+    const fleeK = sm(17.8 + r.delay * 0.4, 21.5 + r.delay * 0.4, t);
+    let mode, speed = 1;
+    if (t < 3 + r.delay) { lerpV(r.start, r.feed, 0, p); mode = 'alert'; }
+    else if (t < 7.5 + r.delay) { lerpV(r.start, r.feed, arrive, p); mode = 'run'; faceDir(r.obj, r.start, r.feed); }
+    else if (t < 15 + r.delay * 0.5) { p.copy(r.feed); mode = 'feed'; faceDir(r.obj, p, REX); }
+    else if (t < 17.8 + r.delay * 0.4) { p.copy(r.feed); mode = 'alert'; faceDir(r.obj, p, THERI_END); }
+    else { lerpV(r.feed, r.flee, fleeK, p); mode = fleeK < 1 ? 'run' : 'alert'; speed = 1.3; faceDir(r.obj, r.feed, r.flee); }
+    placeOnGround(r.obj, p);
+    animateRaptor(r, t, mode, speed);
+    r.obj.visible = !(fleeK >= 1);
+  });
+
+  // ---- therizinosaur ----
+  const walk = sm(12.5, 17, t);
+  lerpV(THERI_START, THERI_END, walk, tmp);
+  placeOnGround(theri, tmp);
+  if (t < 17) faceDir(theri, THERI_START, THERI_END);
+  else theri.rotation.y = THREE.MathUtils.lerp(Math.atan2(THERI_END.x - THERI_START.x, THERI_END.z - THERI_START.z), Math.atan2(REX.x - THERI_END.x, REX.z - THERI_END.z), sm(17, 18, t));
+  const roar = sm(17.2, 18, t) * (1 - sm(20.5, 21.8, t)) + sm(26, 26.8, t) * (1 - sm(28.5, 29.5, t)) * 0.6;
+  animateTheri(t, walk > 0 && walk < 1 ? 'walk' : 'stand', 1, roar);
+
+  // ---- camera ----
+  const gy = (x, z) => groundH(x, z);
+  if (t < 4) {                       // slow push along the bank
+    const k = t / 4;
+    camPos.set(-30 + k * 6, gy(-30, 0) + 6, -2 + k * 3);
+    camLook.set(2, 1, 14);
+  } else if (t < 8) {                // raptors arriving, from the river side
+    const k = sm(4, 8, t);
+    camPos.set(14 - k * 5, 4.5, 18 - k * 6);
+    camLook.copy(raptorPos[0]).lerp(REX, 0.6).setY(1.2);
+  } else if (t < 13) {               // feeding close-up
+    const k = sm(8, 13, t);
+    camPos.set(-2 - k * 2, 2.6, 10 - k * 1.5);
+    camLook.set(3, 0.9, 2.5);
+  } else if (t < 17) {               // pan to the forest edge; therizinosaur emerges
+    const k = sm(13, 17, t);
+    camPos.set(-7 - k * 6, 4 + k, 12 - k * 2);
+    camLook.copy(theri.position).add(tmp2.set(0, 3.5, 0));
+  } else if (t < 21.5) {             // roar: dramatic low-angle dolly-in
+    const k = sm(17, 21.5, t);
+    const ang = -0.9 + k * 0.5;
+    const d = 20 - k * 8;
+    camPos.set(THERI_END.x + Math.sin(ang) * d, gy(THERI_END.x, THERI_END.z) + 1.6 + k * 1.5, THERI_END.z + Math.cos(ang) * d);
+    camLook.copy(theri.position).add(tmp2.set(0, 4.5 + k * 1.5, 0));
+    const shake = sm(17.4, 17.9, t) * (1 - sm(19.5, 21, t)) * 0.18;
+    camPos.x += (Math.random() - 0.5) * shake; camPos.y += (Math.random() - 0.5) * shake;
+  } else {                           // slow orbit around the victor
+    const k = sm(21.5, 30, t);
+    const ang = -0.5 + k * 1.0;
+    const d = 13 + k * 6;
+    camPos.set(THERI_END.x + Math.sin(ang) * d, gy(THERI_END.x, THERI_END.z) + 3.5 + k * 3, THERI_END.z + Math.cos(ang) * d);
+    camLook.copy(theri.position).add(tmp2.set(0, 4, 0)).lerp(REX, k * 0.25);
+  }
+  camera.position.copy(camPos);
+  camera.lookAt(camLook);
+
+  // ---- captions ----
+  const c = captions.find(([a, b]) => t >= a && t < b);
+  hud.textContent = c ? c[2] : '';
+}
+
+// ---------- loop ----------
+function tick() {
+  requestAnimationFrame(tick);
+  const now = clock.getElapsedTime();
+  const t = (now - t0) % T_END;
+  // river ripples
+  const p = water.geometry.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setY(i, Math.sin(waterBase[i * 3] * 0.6 + now * 1.5) * 0.08 + Math.cos(waterBase[i * 3 + 2] * 1.5 + now) * 0.05);
+  p.needsUpdate = true; water.geometry.computeVertexNormals();
+  update(t);
+  renderer.render(scene, camera);
+}
+tick();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+window.__seek = (t) => { t0 = clock.getElapsedTime() - t; }; // debug hook
+</script>
+</body>
+</html>
